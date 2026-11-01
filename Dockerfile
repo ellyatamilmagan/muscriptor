@@ -1,4 +1,10 @@
-# syntax=docker/dockerfile:1
+# Hugging Face Space version of the original MuScriptor Dockerfile.
+# Differences from upstream (everything else is kept identical):
+#   * runs as UID 1000 ("user"), which is what Spaces require
+#   * listens on port 7860 (Spaces default; README front matter says the same)
+#   * no BuildKit cache/bind mounts (plain COPY instead) for builder compatibility
+#   * model size is chosen at runtime through the MUSCRIPTOR_MODEL variable
+
 FROM node:22-bookworm-slim AS web-builder
 WORKDIR /web
 
@@ -9,8 +15,7 @@ COPY web/package.json web/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 
 COPY web/ ./
-# The GA4 measurement ID is inlined into the JS bundle by Vite; left unset
-# (the default), the frontend is built with analytics disabled entirely.
+# Analytics stay disabled unless a measurement ID is passed in.
 ARG VITE_GA_MEASUREMENT_ID=
 ENV VITE_GA_MEASUREMENT_ID=$VITE_GA_MEASUREMENT_ID
 # vite outDir is ../muscriptor/web_dist, i.e. /muscriptor/web_dist in this stage.
@@ -19,17 +24,17 @@ RUN pnpm run build
 
 FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS runtime
 
-
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
-    UV_FROZEN=1
+    UV_FROZEN=1 \
+    UV_NO_CACHE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/home/user \
+    HF_HOME=/home/user/.cache/huggingface \
+    PATH=/app/.venv/bin:$PATH
 
-WORKDIR /app
-
-# fluidsynth is required at runtime for MIDI auralization (the /auralize endpoint).
-# The rest are what the MuseScore AppImage below needs from the system: its own
-# AppRun substitutes bundled fallbacks for OpenGL/jack/nss/pipewire, but these
-# five it expects to find installed.
+# fluidsynth: MIDI playback (/auralize). The rest is what the MuseScore
+# AppImage needs from the system (sheet-music export).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         fluidsynth \
@@ -41,6 +46,10 @@ RUN apt-get update \
         libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
+# Spaces run the container as UID 1000
+RUN useradd -m -u 1000 user
+
+WORKDIR /app
 
 ARG MUSESCORE_URL=https://github.com/musescore/MuseScore/releases/download/v4.7.4/MuseScore-Studio-4.7.4.260706075-x86_64.AppImage
 RUN curl -fsSL -o /tmp/musescore.AppImage "$MUSESCORE_URL" \
@@ -53,15 +62,11 @@ RUN curl -fsSL -o /tmp/musescore.AppImage "$MUSESCORE_URL" \
 
 ENV MUSCRIPTOR_MUSESCORE=/opt/musescore/AppRun
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    --mount=type=bind,source=uv.lock,target=uv.lock \
-    uv sync --no-install-project
+# Python dependencies (cached as long as pyproject.toml / uv.lock don't change)
+COPY pyproject.toml uv.lock ./
+RUN uv sync --no-install-project
 
-# Pre-fetch the soundfonts (253 MB: .sf2 for /auralize, .sf3 for the web UI)
-# into the HF hub cache so a fresh container doesn't download them on first
-# use. Runs off just the two files it needs, before the full source COPY,
-# so day-to-day code changes don't re-trigger the download.
+# Pre-fetch the soundfonts into the HF cache of "user" so the first request is fast.
 COPY muscriptor/soundfonts.py muscriptor/utils/download.py /tmp/prewarm/
 RUN /app/.venv/bin/python -c "\
 import sys; sys.path.insert(0, '/tmp/prewarm'); \
@@ -70,13 +75,22 @@ download.download_if_necessary(soundfonts.SF2_URL); \
 download.download_if_necessary(soundfonts.SF3_URL)" \
     && rm -rf /tmp/prewarm
 
-COPY pyproject.toml uv.lock README.md ./
+COPY README.md ./
 COPY muscriptor/ ./muscriptor/
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync
+RUN uv sync
 
 COPY --from=web-builder /muscriptor/web_dist ./muscriptor/web_dist
 
+# everything the runtime user must be able to write (HF cache, MuseScore config, temp files)
+RUN mkdir -p /home/user/.cache /home/user/.config \
+    && chown -R user:user /home/user \
+    && chmod -R a+rX /app /opt/musescore
 
-EXPOSE 8000
-ENTRYPOINT ["uv", "run", "muscriptor", "serve", "--host", "0.0.0.0"]
+USER user
+WORKDIR /app
+
+EXPOSE 7860
+
+# MUSCRIPTOR_MODEL (Space variable): small | medium | large   (default: small, fits free CPU)
+# HF_TOKEN (Space secret) is read automatically by huggingface_hub to download the gated weights.
+CMD ["sh", "-c", "exec muscriptor serve --host 0.0.0.0 --port 7860 --model ${MUSCRIPTOR_MODEL:-small}"]
