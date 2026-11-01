@@ -1,0 +1,62 @@
+name: Deploy MuScriptor Web to Hugging Face Space
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'Dockerfile'
+      - 'muscriptor/**'
+      - 'web/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/deploy_space.py'
+      - '.github/workflows/deploy-space.yml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      HF_TOKEN:         ${{ secrets.HF_TOKEN }}
+      SPACE_ID:         ${{ vars.SPACE_ID }}
+      SPACE_HARDWARE:   ${{ vars.SPACE_HARDWARE }}
+      MUSCRIPTOR_MODEL: ${{ vars.MUSCRIPTOR_MODEL }}
+      SPACE_PRIVATE:    ${{ vars.SPACE_PRIVATE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install huggingface_hub
+        run: pip install --quiet "huggingface_hub>=0.25"
+
+      # Spaces read their settings from YAML front matter at the top of README.md.
+      # This only edits the CI checkout, nothing is committed back to GitHub.
+      - name: Add Space front matter to README
+        run: |
+          {
+            printf '%s\n' '---'
+            printf '%s\n' 'title: ETM MuScriptor'
+            printf '%s\n' 'emoji: 🎼'
+            printf '%s\n' 'colorFrom: blue'
+            printf '%s\n' 'colorTo: indigo'
+            printf '%s\n' 'sdk: docker'
+            printf '%s\n' 'app_port: 7860'
+            printf '%s\n' 'pinned: false'
+            printf '%s\n' 'short_description: Multi-instrument audio to MIDI and sheet music'
+            printf '%s\n' '---'
+            printf '\n'
+            cat README.md
+          } > README.space.md
+          mv README.space.md README.md
+          head -n 14 README.md
+
+      - name: Create / update the Space and upload
+        run: python .github/deploy_space.py
